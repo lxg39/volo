@@ -1,0 +1,59 @@
+# system config
+mode: 1
+distribute: False
+num_parallel_workers: 2
+
+# dataset config
+dataset: 'imagenet'
+data_dir: 'E:\Downloads\imagenet'
+train_split: 'train'
+shuffle: True
+dataset_download: False
+batch_size: 32
+drop_remainder: True
+
+
+# Augmentation config
+image_resize: 224
+scale: [0.08, 1.0]
+ratio: [0.75, 1.333]
+hflip: 0.5
+vflip: 0.
+interpolation: 'bicubic'
+auto_augment: True
+re_prob: 0.25
+#这个mixup和cutmix论文里说没用是不是可以不写
+#mixup: 0.0
+crop_pct: 0.96
+color_jitter: [0.4, 0.4, 0.4]
+
+# model config
+model: 'volo_d1'
+num_classes: 1000
+pretrained: False
+ckpt_path: 'F:/mindcv/volo_d1-1_625.ckpt'
+keep_checkpoint_max: 10
+ckpt_save_dir: './'
+epoch_size: 1
+dataset_sink_mode: True
+amp_level: 'O2'
+
+# loss config
+loss: 'CE'
+label_smoothing: 0.1
+
+# lr scheduler config
+scheduler: 'warmup_cosine_decay'
+lr: 0.0016
+min_lr: 0.00001
+warmup_epochs: 20
+decay_epochs: 30
+decay_rate: 0.1
+
+# optimizer config
+opt: 'adamw'
+weight_decay: 0.05
+momentum: 0.9
+filter_bias_and_bn: True
+loss_scale: 1024
+use_nesterov: False
