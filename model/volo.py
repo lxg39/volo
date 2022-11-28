@@ -15,7 +15,7 @@
 """
 Vision OutLOoker (VOLO) implementation
 """
-import mindspore
+import mindspore as ms
 import mindspore.nn as nn
 from mindspore import ops
 from mindspore import Parameter
@@ -23,8 +23,11 @@ from mindspore import Tensor
 from mindspore import dtype as mstype
 import mindspore.common.initializer as init
 import mindspore.ops.functional as F
-from mindspore.numpy import empty, ceil
+from mindspore import numpy as msnp
+from .registry import register_model
+from mindspore.ops import constexpr
 
+import time
 import math
 import numpy as np
 
@@ -55,7 +58,8 @@ def drop_path(x: Tensor,
         return x
     keep_prob = 1 - drop_prob
     shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    random_tensor = ops.bernoulli(empty(shape), p=keep_prob)
+    random_tensor = ops.Dropout(keep_prob=keep_prob)(msnp.ones(shape))[1]
+    random_tensor = ops.Cast()(random_tensor, x.dtype)
     if keep_prob > 0. and scale_by_keep:
         random_tensor = ops.div(random_tensor, keep_prob)
     return x * random_tensor
@@ -73,52 +77,111 @@ class DropPath(nn.Cell):
     def construct(self, x: Tensor) -> Tensor:
         return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
 
-def unfold(img, kernel_size, stride=1, pad=0, dilation=1):
-    """
-    unfold function
-    """
-    img = img.asnumpy()
-    batch_num, channel, height, width = img.shape
-    out_h = (height + pad + pad - kernel_size - (kernel_size - 1) * (dilation - 1)) // stride + 1
-    out_w = (width + pad + pad - kernel_size - (kernel_size - 1) * (dilation - 1)) // stride + 1
+# def unfold(img, kernel_size, stride=1, pad=0, dilation=1):
+#     """
+#     unfold function
+#     """
+#     # img = img.asnumpy()
+#     start = time.time()
+#     print("\nunfold shape", img.shape)
+#     batch_num, channel, height, width = img.shape
+#     out_h = (height + pad + pad - kernel_size - (kernel_size - 1) * (dilation - 1)) // stride + 1
+#     out_w = (width + pad + pad - kernel_size - (kernel_size - 1) * (dilation - 1)) // stride + 1
 
-    img = np.pad(img, [(0, 0), (0, 0), (pad, pad), (pad, pad)], 'constant')
-    col = np.zeros((batch_num, channel, kernel_size, kernel_size, out_h, out_w)).astype(img.dtype)
+#     img = msnp.pad(img, [(0, 0), (0, 0), (pad, pad), (pad, pad)], 'constant')
+#     col = msnp.zeros((batch_num, channel, kernel_size, kernel_size, out_h, out_w), dtype=img.dtype)
 
-    for y in range(kernel_size):
-        y_max = y + stride * out_h
-        for x in range(kernel_size):
-            x_max = x + stride * out_w
-            col[:, :, y, x, :, :] = img[:, :, y:y_max:stride, x:x_max:stride]
+#     for y in range(kernel_size):
+#         y_max = y + stride * out_h
+#         for x in range(kernel_size):
+#             x_max = x + stride * out_w
+#             col[:, :, y, x, :, :] = img[:, :, y:y_max:stride, x:x_max:stride]
 
-    col = np.reshape(col, (batch_num, channel*kernel_size*kernel_size, out_h*out_w))
-    col = Tensor(col)
+#     col = msnp.reshape(col, (batch_num, channel*kernel_size*kernel_size, out_h*out_w))
+#     # col = Tensor(col)
+#     end = time.time()
+#     print("unfold rum time", end - start)
+#     return col
 
-    return col
+import numpy as np
+import mindspore as ms
+from mindspore import nn, ops
 
 
-def fold(col, input_shape, kernel_size, stride=1, pad=0):
-    """
-    fold function
-    """
-    col = col.asnumpy()
-    batch_num, channel, height, width = input_shape
-    out_h = (height + pad + pad - kernel_size) // stride + 1
-    out_w = (width + pad + pad - kernel_size) // stride + 1
+# class NewConv2DTranspose(nn.Cell):
+#     def __init__(self, c, kernel_size, _pad, _stride, _dilation):
+#         super().__init__()
+#         self.conv_transpose2d = ops.Conv2DTranspose(c, kernel_size, pad_mode="pad", pad=_pad, 
+#             stride=_stride, dilation=_dilation, group=c)
+    
+#     def construct(self, tensor, weight, output_shape):
+#         out = self.conv_transpose2d(tensor, weight, output_shape)
 
-    col = col.reshape(batch_num, channel, kernel_size, kernel_size, out_h, out_w)
-    img = np.zeros((batch_num,
-                    channel,
-                    height + pad + pad + stride - 1,
-                    width + pad + pad + stride - 1)) \
-        .astype(col.dtype)
-    for y in range(kernel_size):
-        y_max = y + stride * out_h
-        for x in range(kernel_size):
-            x_max = x + stride * out_w
-            img[:, :, y:y_max:stride, x:x_max:stride] += col[:, :, y, x, :, :]
+#         return out
 
-    return Tensor(img[:, :, pad:height + pad, pad:width + pad])
+class Fold(nn.Cell):
+    def __init__(self, channels, output_size, kernel_size, dilation=1, padding=0, stride=1) -> None:
+        """Alternative implementation of fold layer via transposed convolution.
+        All parameters are the same as `"torch.nn.Fold" <https://pytorch.org/docs/stable/generated/torch.nn.Fold.html>`_,
+        except for the additional `channels` parameter. We need `channels` to calculate the pre-allocated memory size of the convolution kernel.
+        :param channels: same as the `C` in the document of `"torch.nn.Fold" <https://pytorch.org/docs/stable/generated/torch.nn.Fold.html>`_
+        :type channels: int
+        """
+        super().__init__()
+        def int2tuple(a):
+            if isinstance(a, int):
+                return (a, a)
+            return a
+        self.output_size, self.kernel_size, self.dilation, self.padding, self.stride = map(int2tuple, (output_size, kernel_size, dilation, padding, stride))
+        self.h = int((self.output_size[0] + 2 * self.padding[0] - self.dilation[0] * (self.kernel_size[0] - 1) - 1) / self.stride[0] + 1)
+        self.w = int((self.output_size[1] + 2 * self.padding[1] - self.dilation[1] * (self.kernel_size[1] - 1) - 1) / self.stride[1] + 1)
+        self.k = self.kernel_size[0] * self.kernel_size[1]
+        self.c = channels
+        self.ck = self.c * self.k
+        weight = np.zeros((self.ck, 1, self.kernel_size[0], self.kernel_size[1]))
+        for i in range(self.ck):
+            xy = i % self.k
+            x = xy // self.kernel_size[1]
+            y = xy % self.kernel_size[1]
+            weight[i, 0, x, y] = 1
+        
+        self.weight = Parameter(ms.Tensor(weight, ms.float16), requires_grad=False)
+        self.conv_transpose2d = ops.Conv2DTranspose(self.c, self.kernel_size,
+                                                    pad_mode="pad", pad=(self.padding[0], self.padding[0], self.padding[1], self.padding[1]),
+                                                    stride=stride, dilation=dilation, group=self.c)
+
+
+    def construct(self, tensor):
+        b, ck, l = tensor.shape
+        # todo: assert is not allowed in construct, how to check the shape?
+        # assert ck == self.c * self.k
+        # assert l == self.h * self.w
+        tensor = tensor.view((b, ck, self.h, self.w))
+        out = self.conv_transpose2d(tensor.view((b, ck, self.h, self.w)), self.weight, (b, self.c, self.output_size[0], self.output_size[1]))
+        
+        return out
+
+# def fold(col, input_shape, kernel_size, stride=1, pad=0):
+#     """
+#     fold function
+#     """
+#     batch_num, channel, height, width = input_shape
+#     out_h = (height + pad + pad - kernel_size) // stride + 1
+#     out_w = (width + pad + pad - kernel_size) // stride + 1
+
+#     col = msnp.reshape(col, (batch_num, channel, kernel_size, kernel_size, out_h, out_w))
+#     img = msnp.zeros((batch_num,
+#                     channel,
+#                     height + pad + pad + stride - 1,
+#                     width + pad + pad + stride - 1), dtype=col.dtype)
+#     for y in range(kernel_size):
+#         y_max = y + stride * out_h
+#         for x in range(kernel_size):
+#             x_max = x + stride * out_w
+#             img[:, :, y:y_max:stride, x:x_max:stride] += col[:, :, y, x, :, :]
+
+#     out = img[:, :, pad:height + pad, pad:width + pad]
+#     return out
 
 
 class OutlookAttention(nn.Cell):
@@ -147,8 +210,8 @@ class OutlookAttention(nn.Cell):
         self.proj = nn.Dense(dim, dim)
         self.proj_drop = nn.Dropout(1.0 - proj_drop)
 
-        # self.unfold = nn.Unfold(ksizes=[1, kernel_size, kernel_size, 1], strides=[1, stride, stride, 1],
-                                # rates=[1, 1, 1, 1])
+        self.unfold = nn.Unfold(ksizes=[1, kernel_size, kernel_size, 1], strides=[1, stride, stride, 1],
+                                rates=[1, 1, 1, 1])
         self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride)
         self.softmax = nn.Softmax(axis=-1)
         self.reshape = ops.Reshape()
@@ -160,12 +223,21 @@ class OutlookAttention(nn.Cell):
 
         v = ops.Transpose()(self.v(x), (0, 3, 1, 2))  # B, C, H, W
 
-        h, w = ceil(H / self.stride), ceil(W / self.stride)
-        # v = ops.pad(v, ((0, 0), (0, 0), (1, 1), (1,1)))  舍弃ms的算子，改用函数定义
-        v = unfold(v, self.kernel_size, self.stride, self.padding)
+        h = int((H - 1) / self.stride + 1)
+        w = int((W - 1) / self.stride + 1)
+        # start = time.time()
+        v = ops.pad(v, ((0, 0), (0, 0), (1, 1), (1,1)))  # 舍弃ms的算子，改用函数定义
+        # v = unfold(v, self.kernel_size, self.stride, self.padding)
+        v = self.unfold(v)
+        # end = time.time()
+        # print("ms-unfold run time", end - start)
+        # start = time.time()
         v = self.reshape(v, (B, self.num_heads, C // self.num_heads,
                                    self.kernel_size * self.kernel_size,
                                    h * w))
+        # end = time.time()
+        # print("\n")
+        # print("reshape run time", end - start)
         v = self.transpose(v, (0, 1, 4, 3, 2))  # B,H,N,kxk,C/H
 
         attn = self.pool(self.transpose(x, (0, 3, 1, 2)))
@@ -180,10 +252,12 @@ class OutlookAttention(nn.Cell):
 
         x = self.transpose(self.batch_mat_mul(attn, v), (0, 1, 4, 3, 2))
         x = self.reshape(x, 
-            (B, C, self.kernel_size * self.kernel_size, h * w))
-        x = fold(x, input_shape=(B, C, H, W), kernel_size=self.kernel_size,
-                    stride=self.stride, pad=self.padding)
-
+            (B, C * self.kernel_size * self.kernel_size, h * w))
+        # print("H+", H, "W", W)
+        fold = Fold(C, (H, W), self.kernel_size, padding=self.padding, stride=self.stride)
+        # print("before", x.shape)
+        x = fold(x)
+        # print("after", x.shape)
         x = self.proj(self.transpose(x, (0, 2, 3, 1)))
         x = self.proj_drop(x)
 
@@ -220,8 +294,12 @@ class Outlooker(nn.Cell):
         self.mlp = Mlp(in_features=dim,
                        hidden_features=mlp_hidden_dim,
                        act_layer=act_layer)
+        # print("dim---", dim, "kernel_size---", kernel_size, "strid---", stride)
 
     def construct(self, x):
+        # print("\nxx",x.shape)
+        # print("\nnorm", self.norm1(x).shape)
+        # print("\nattn", self.attn(self.norm1(x)).shape)
         x = x + self.drop_path(self.attn(self.norm1(x)))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
@@ -265,7 +343,7 @@ class Attention(nn.Cell):
         self.proj = nn.Dense(dim, dim)
         self.proj_drop = nn.Dropout(1.0 - proj_drop)
         self.reshape = ops.Reshape()
-        self.transpose = ops.Transpose()
+        self.transpose = ops.Transpose() 
         self.softmax = nn.Softmax(axis=-1)
         self.batch_mat_mul_transpose = ops.BatchMatMul(transpose_b=True)
         self.batch_mat_mul = ops.BatchMatMul()
@@ -431,7 +509,7 @@ def get_block(block_type, **kargs):
 #     bbx2 = np.clip(cx + cut_w // 2, 0, W)
 #     bby2 = np.clip(cy + cut_h // 2, 0, H)
 
-#     return bbx1, bby1, bbx2, bby2
+#     return int(bbx1), int(bby1), int(bbx2), int(bby2)
 
 
 class PatchEmbed(nn.Cell):
@@ -580,7 +658,6 @@ class VOLO(nn.Cell):
             ops.Zeros()((1, img_size // patch_size // pooling_scale,
                         img_size // patch_size // pooling_scale,
                         embed_dims[-1]), mstype.float32))
-
         self.pos_drop = nn.Dropout(1.0 - drop_rate)
 
         # set the main block in network
@@ -679,39 +756,26 @@ class VOLO(nn.Cell):
         B, H, W, C = x.shape
         x = ops.Reshape()(x, (B, -1, C))
         return x
-
+   
     def forward_cls(self, x):
-        B, N, C = x.shape
-        cls_tokens = ops.broadcast_to(self.cls_token, (B, -1, -1))
+        # B, N, C = x.shape
+        cls_tokens = ops.broadcast_to(self.cls_token, (x.shape[0], -1, -1))
+        x = ops.Cast()(x, cls_tokens.dtype)
         x = ops.Concat(1)([cls_tokens, x])
         for block in self.post_network:
             x = block(x)
         return x
-    
-    # def test_if(self, x):
-    #     # step3: post network, apply class attention or not
-    #     if self.post_network is not None:
-    #         x = self.forward_cls(x)
-    #     x = self.norm(x)
 
-    #     if self.return_mean:  # if no class token, return mean
-    #         return self.head(ops.mean(x, 1))
-
-    #     x_cls = self.head(x[:, 0])
-    #     if not self.return_dense:
-    #         return x_cls
-    #     return x_cls
-    
     def construct(self, x):
         # step1: patch embedding
         x = self.forward_embeddings(x)
 
-        # mix token, see token labeling for details.
-        # if self.mix_token and not self.training:
+        # patch_h, patch_w = x.shape[1] // self.pooling_scale, x.shape[
+        #      2] // self.pooling_scale
+        # # mix token, see token labeling for details.
+        # if self.mix_token and self._phase == 'train':
         #     lam = np.random.beta(self.beta, self.beta)
-        #     patch_h, patch_w = x.shape[1] // self.pooling_scale, x.shape[
-        #         2] // self.pooling_scale
-        #     bbx1, bby1, bbx2, bby2 = rand_bbox(x.shape, lam, bbscale=self.pooling_scale)
+        #     bbx1, bby1, bbx2, bby2 = rand_bbox(x.shape, lam, scale=self.pooling_scale)
         #     temp_x = x.copy()
         #     sbbx1,sbby1,sbbx2,sbby2=self.pooling_scale*bbx1,self.pooling_scale*bby1,\
         #                             self.pooling_scale*bbx2,self.pooling_scale*bby2
@@ -735,16 +799,14 @@ class VOLO(nn.Cell):
         if not self.return_dense:
             return x_cls
 
-        # x = self.test_if(self, x)
-        
         # x_aux = self.aux_head(
         #     x[:, 1:]
         # )  # generate classes in all feature tokens, see token labeling
 
-        # if self.training:
+        # if self._phase == 'predict':
         #     return x_cls + 0.5 * x_aux.max(1)[0]
 
-        # if self.mix_token and not self.training:  # reverse "mix token", see token labeling for details.
+        # if self.mix_token and self._phase == 'train':  # reverse "mix token", see token labeling for details.
         #     x_aux = ops.Reshape()(x_aux, (x_aux.shape[0], patch_h, patch_w, x_aux.shape[-1]))
 
         #     temp_x = x_aux.copy()
@@ -754,12 +816,9 @@ class VOLO(nn.Cell):
         #     x_aux = ops.Reshape()(x_aux, (x_aux.shape[0], patch_h * patch_w, x_aux.shape[-1]))
 
         # return these: 1. class token, 2. classes from all feature tokens, 3. bounding box
-        # print("x_cls", x_cls.shape)
-        return x_cls
-        # , x_aux, (bbx1, bby1, bbx2, bby2)
-        # return x
+        return x_cls # , x_aux, (bbx1, bby1, bbx2, bby2)
 
-# @register_model
+@register_model
 def volo_d1(pretrained=False, **kwargs):
     """
     VOLO-D1 model, Params: 27M
@@ -791,7 +850,7 @@ def volo_d1(pretrained=False, **kwargs):
     model.default_cfg = default_cfgs['volo']
     return model
 
-# @register_model
+@register_model
 def volo_d2(pretrained=False, **kwargs):
     """
     VOLO-D2 model, Params: 59M
@@ -813,7 +872,7 @@ def volo_d2(pretrained=False, **kwargs):
     model.default_cfg = default_cfgs['volo']
     return model
 
-# @register_model
+@register_model
 def volo_d3(pretrained=False, **kwargs):
     """
     VOLO-D3 model, Params: 86M
@@ -835,7 +894,7 @@ def volo_d3(pretrained=False, **kwargs):
     model.default_cfg = default_cfgs['volo']
     return model
 
-# @register_model
+@register_model
 def volo_d4(pretrained=False, **kwargs):
     """
     VOLO-D4 model, Params: 193M
@@ -857,7 +916,7 @@ def volo_d4(pretrained=False, **kwargs):
     model.default_cfg = default_cfgs['volo_large']
     return model
 
-# @register_model
+@register_model
 def volo_d5(pretrained=False, **kwargs):
     """
     VOLO-D5 model, Params: 296M
